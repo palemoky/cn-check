@@ -8,12 +8,13 @@
 
 | 检测项 | 权重 | 原理 |
 |---|---:|---|
-| IP 归属地 | 25 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），最直接的信号 |
-| 被屏蔽服务可达性 | 20 | 探测 Google (`generate_204`) 是否可达；不可达强烈暗示身处 GFW 之内 |
-| 大陆站点延迟 | 15 | 对百度、腾讯 favicon 多次采样取最小延迟；< 60ms 说明物理位置在大陆或紧邻 |
-| 浏览器时区 | 12 | `Intl.DateTimeFormat().resolvedOptions().timeZone` 为 `Asia/Shanghai` 等 |
+| IP 归属地 | 23 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），最直接的信号 |
+| 被屏蔽服务可达性 | 18 | 探测 Google (`generate_204`) 是否可达；不可达强烈暗示身处 GFW 之内 |
+| 大陆站点延迟 | 13 | 对百度、腾讯、哔哩哔哩 favicon 各采样 3 次取每站最小值，再取三站中**第二低**的值打分（单站可能有海外 CDN 节点，需两站佐证）；< 60ms 说明物理位置在大陆或紧邻 |
+| 浏览器时区 | 11 | `Intl.DateTimeFormat().resolvedOptions().timeZone` 为 `Asia/Shanghai` 等 |
 | 浏览器语言 | 10 | `navigator.languages` 首选 `zh-CN` / `zh-Hans` |
-| 边缘接入特征 | 8 | Cloudflare 在大陆无公开节点，大陆直连用户到边缘的 TCP RTT（`cf.clientTcpRtt`）通常 > 100ms |
+| 台湾旗帜 Emoji | 8 | 大陆行货或地区设为中国的 Apple 设备会屏蔽 🇹🇼（canvas 对比连字与拆分渲染，用 🇨🇳 做对照）；设备级信号，VPN 无法掩盖 |
+| 边缘接入特征 | 7 | Cloudflare 在大陆无公开节点，大陆直连用户到边缘的 TCP RTT（`cf.clientTcpRtt`）通常 > 100ms |
 | 时区一致性 | 5 | 浏览器时区与 IP 归属地时区不一致 → 代理迹象；若浏览器时区指向中国则计入中国分 |
 | WebRTC 泄露 | 5 | STUN (srflx) 公网地址与 HTTP 出口 IP 不一致 → HTTP 走代理而 UDP 直连 |
 

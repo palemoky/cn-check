@@ -3,6 +3,9 @@
   "name": "china-access-check",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-06",
+  "routes": [
+    { "pattern": "cn.palemoky.com", "custom_domain": true }
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

@@ -5,12 +5,13 @@
  * 总分 100。每项检测产出 0~1 的置信度，乘以权重后求和。
  * ============================================================ */
 const WEIGHTS = {
-  ipCountry: 25, // IP 归属地为中国大陆
-  blocked: 20,   // 无法访问 Google 等在大陆被屏蔽的服务
-  latency: 15,   // 到大陆站点的延迟显著更低（说明物理位置近）
-  timezone: 12,  // 浏览器时区为中国时区
+  ipCountry: 23, // IP 归属地为中国大陆
+  blocked: 18,   // 无法访问 Google 等在大陆被屏蔽的服务
+  latency: 13,   // 到大陆站点的延迟显著更低（说明物理位置近）
+  timezone: 11,  // 浏览器时区为中国时区
   language: 10,  // 浏览器语言为简体中文
-  rtt: 8,        // 到 Cloudflare 边缘的 TCP RTT 偏高（典型跨境直连特征）
+  twFlag: 8,     // 台湾旗帜 emoji 被屏蔽（大陆行货/中国区 Apple 设备，VPN 无法掩盖）
+  rtt: 7,        // 到 Cloudflare 边缘的 TCP RTT 偏高（典型跨境直连特征）
   tzMismatch: 5, // 浏览器时区与 IP 归属地时区不一致（代理迹象）
   webrtc: 5,     // WebRTC 泄露了与 HTTP 不同的公网 IP（代理迹象）
 };
@@ -25,10 +26,13 @@ const THRESHOLDS = {
   rttMid: 80,
 };
 
-// 大陆可达、境外访问明显偏慢的站点（favicon 支持 no-cors 拉取）
+// 大陆可达、境外访问明显偏慢的站点（favicon 支持 no-cors 拉取）。
+// 打分时取“第二低”的站点延迟：单个站点可能有海外 CDN 节点，
+// 要求至少两个站点同时低延迟才认为身处大陆附近，降低误判。
 const CHINA_ENDPOINTS = [
   { name: "百度", url: "https://www.baidu.com/favicon.ico" },
   { name: "腾讯", url: "https://www.qq.com/favicon.ico" },
+  { name: "哔哩哔哩", url: "https://www.bilibili.com/favicon.ico" },
 ];
 
 // 在大陆被屏蔽的服务
@@ -136,6 +140,70 @@ function checkLanguage() {
   };
 }
 
+function checkTwFlag() {
+  const size = 48;
+  const canvas = document.createElement("canvas");
+  canvas.width = size * 2.5;
+  canvas.height = size * 1.4;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) {
+    return { confidence: 0, summary: "无法判断", detail: "Canvas 不可用，无法检测" };
+  }
+  ctx.font = `${size}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
+  ctx.textBaseline = "top";
+
+  const render = (text) => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillText(text, 2, 4);
+    const d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let colored = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      const max = Math.max(d[i], d[i + 1], d[i + 2]);
+      const min = Math.min(d[i], d[i + 1], d[i + 2]);
+      if (d[i + 3] > 128 && max - min > 40) colored++;
+    }
+    return { sig: canvas.toDataURL(), colored };
+  };
+
+  // 旗帜 emoji 由两个区域指示符组成；中间插入零宽空格可阻止其合并。
+  // 真正的旗帜需同时满足两个条件：
+  // 1. 合成：原样渲染与拆开渲染结果不同（否则只是两个并排的字母）；
+  // 2. 彩色：被审查的设备会把 🇹🇼 合成为一个黑白占位框，而非彩色旗帜。
+  const probeFlag = (flag) => {
+    const pair = render(flag);
+    const split = render(flag.slice(0, 2) + "\u200b" + flag.slice(2));
+    return { ligates: pair.sig !== split.sig, colorful: pair.colored > 30 };
+  };
+
+  const cn = probeFlag("🇨🇳");
+  const tw = probeFlag("🇹🇼");
+
+  if (!cn.ligates || !cn.colorful) {
+    return {
+      confidence: 0,
+      summary: "无法判断",
+      detail: "系统不渲染彩色旗帜 emoji（常见于 Windows），此项无法用于判断",
+    };
+  }
+  if (!tw.ligates || !tw.colorful) {
+    return {
+      confidence: 1,
+      summary: "🇹🇼 被系统屏蔽",
+      flags: ["台湾旗帜 emoji 被屏蔽：设备为大陆行货或地区设为中国大陆，VPN 无法掩盖此特征"],
+      detail:
+        "🇨🇳 正常渲染为彩色旗帜，🇹🇼 却" +
+        (tw.ligates ? "被替换成黑白占位符" : "未合成旗帜") +
+        "。\n大陆销售的 Apple 设备或地区设为中国大陆的系统会屏蔽台湾旗帜，" +
+        "这是一个与网络无关的设备级信号",
+    };
+  }
+  return {
+    confidence: 0,
+    summary: "正常渲染",
+    detail: "🇹🇼 与 🇨🇳 均正常渲染为彩色旗帜，设备未启用大陆地区的 emoji 屏蔽",
+  };
+}
+
 async function checkBlocked() {
   // 先确认本站可达（它就是对照组：用户网络本身是通的）
   const results = await Promise.all(BLOCKED_ENDPOINTS.map((e) => probe(e.url)));
@@ -158,17 +226,19 @@ async function checkLatency() {
   const results = await Promise.all(
     CHINA_ENDPOINTS.map(async (e) => ({ ...e, ms: await minLatency(e.url) }))
   );
-  const best = Math.min(...results.map((r) => r.ms));
+  // 取第二低的站点延迟：即使某站的海外 CDN 节点碰巧很快，也需要另一个站佐证
+  const sorted = results.map((r) => r.ms).sort((a, b) => a - b);
+  const basis = sorted[1];
   let confidence = 0;
-  if (best < THRESHOLDS.latencyNear) confidence = 1;
-  else if (best < THRESHOLDS.latencyMid) confidence = 0.6;
-  else if (best < THRESHOLDS.latencyFar) confidence = 0.2;
+  if (basis < THRESHOLDS.latencyNear) confidence = 1;
+  else if (basis < THRESHOLDS.latencyMid) confidence = 0.6;
+  else if (basis < THRESHOLDS.latencyFar) confidence = 0.2;
   return {
     confidence,
-    summary: best === Infinity ? "大陆站点不可达" : `最低 ${best} ms`,
+    summary: basis === Infinity ? "大陆站点不可达" : `${basis} ms（第二低）`,
     detail:
       results.map((r) => `${r.name}: ${fmtMs(r.ms)}`).join("\n") +
-      `\n延迟 < ${THRESHOLDS.latencyNear} ms 说明物理位置在大陆或紧邻大陆`,
+      `\n取第二低值打分（防单站海外 CDN 误判），< ${THRESHOLDS.latencyNear} ms 说明物理位置在大陆或紧邻大陆`,
   };
 }
 
@@ -261,7 +331,8 @@ const CHECK_DEFS = [
   { key: "blocked", icon: "🚧", name: "被屏蔽服务可达性" },
   { key: "latency", icon: "⚡", name: "大陆站点延迟" },
   { key: "timezone", icon: "🕐", name: "浏览器时区" },
-  { key: "language", icon: "🈶", name: "浏览器语言" },
+  { key: "language", icon: "🀄️", name: "浏览器语言" },
+  { key: "twFlag", icon: "🏳️", name: "台湾旗帜 Emoji" },
   { key: "rtt", icon: "📡", name: "边缘接入特征" },
   { key: "tzMismatch", icon: "🎭", name: "时区一致性" },
   { key: "webrtc", icon: "🔓", name: "WebRTC 泄露" },
@@ -291,7 +362,8 @@ function fillCard(key, result, score) {
   if (!card) return;
   card.classList.remove("pending");
   card.classList.add(score >= WEIGHTS[key] * 0.8 ? "hit" : score > 0 ? "partial" : "miss");
-  card.querySelector(".card-score").textContent = `${score.toFixed(1)} / ${WEIGHTS[key]}`;
+  // 部分命中会产生小数（如置信度 0.4 × 权重 23 = 9.2），整数时不显示 .0
+  card.querySelector(".card-score").textContent = `${+score.toFixed(1)} / ${WEIGHTS[key]}`;
   card.querySelector(".card-summary").textContent = result.summary;
   card.querySelector(".card-detail").textContent = result.detail || "";
 }
@@ -386,6 +458,12 @@ async function runAll() {
     record("language", lang);
   } catch (e) {
     failCard("language", e);
+  }
+
+  try {
+    record("twFlag", checkTwFlag());
+  } catch (e) {
+    failCard("twFlag", e);
   }
 
   // 网络探测并行跑
