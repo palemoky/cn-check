@@ -1,0 +1,5 @@
+README.md
+.env
+.env.example
+dns-probe
+*.log

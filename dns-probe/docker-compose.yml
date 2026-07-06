@@ -1,0 +1,21 @@
+services:
+  dns-probe:
+    # 由 GitHub Actions 构建并推送到 GHCR，服务器只需拉取。
+    # 私有仓库需先 docker login ghcr.io；可用 DNS_PROBE_IMAGE 覆盖为指定 tag。
+    image: ${DNS_PROBE_IMAGE:-ghcr.io/palemoky/dns-probe:latest}
+    pull_policy: always
+    container_name: dns-probe
+    restart: unless-stopped
+    # 通过环境变量配置（见 .env.example）；未设置时用默认值
+    command:
+      - "-zone"
+      - "${PROBE_ZONE:-d.example.com}"
+      - "-answer"
+      - "${PROBE_ANSWER:-127.0.0.1}"
+      - "-dns"
+      - ":53"
+      - "-http"
+      - ":8080"
+    ports:
+      - "53:53/udp" # 权威 DNS
+      - "127.0.0.1:8080:8080" # 查询 API 只绑本机，由前置 HTTPS 反代暴露

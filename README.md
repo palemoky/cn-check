@@ -1,4 +1,4 @@
-# China Access Check 🧭
+# China Access Check
 
 检测你的浏览环境是否会被 ChatGPT、Claude、LinkedIn 等网站识别为**中国大陆用户**。
 
@@ -6,19 +6,34 @@
 
 ## 检测项与权重
 
+
+无法隐藏的项目：
+- 台湾 emoji 被屏蔽
+- 大陆主流站点稳定低延迟，且美国主流站点不可访问或稳定高延迟
+
+难以隐藏的项目：
+- 非东八区
+- 系统无简体中文字体
+
+
 | 检测项 | 权重 | 原理 |
 |---|---:|---|
-| IP 归属地 | 23 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），最直接的信号 |
+| IP 归属地 | 23 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），并用 chnroutes CIDR 独立核对；最直接的信号 |
 | 被屏蔽服务可达性 | 18 | 探测 Google (`generate_204`) 是否可达；不可达强烈暗示身处 GFW 之内 |
 | 大陆站点延迟 | 13 | 对百度、腾讯、哔哩哔哩 favicon 各采样 3 次取每站最小值，再取三站中**第二低**的值打分（单站可能有海外 CDN 节点，需两站佐证）；< 60ms 说明物理位置在大陆或紧邻 |
 | 浏览器时区 | 11 | `Intl.DateTimeFormat().resolvedOptions().timeZone` 为 `Asia/Shanghai` 等 |
 | 浏览器语言 | 10 | `navigator.languages` 首选 `zh-CN` / `zh-Hans` |
-| 台湾旗帜 Emoji | 8 | 大陆行货或地区设为中国的 Apple 设备会屏蔽 🇹🇼（canvas 对比连字与拆分渲染，用 🇨🇳 做对照）；设备级信号，VPN 无法掩盖 |
-| 边缘接入特征 | 7 | Cloudflare 在大陆无公开节点，大陆直连用户到边缘的 TCP RTT（`cf.clientTcpRtt`）通常 > 100ms |
+| 台湾旗帜 Emoji | 8 | 大陆行货或地区设为中国的 Apple 设备会屏蔽 🇹🇼（canvas 对比连字与拆分渲染 + 彩色像素判定，用 🇨🇳 做对照）；设备级信号，VPN 无法掩盖 |
+| 国际站点延迟 | 8 | 以 AWS 美东/美西/东京/新加坡区域端点为参照（位置固定、无全球 CDN）；「大陆很近 + 美国异常慢（>300ms）」是跨境线路拥堵/GFW 开销的典型形态，港/新/日/韩直连美国多在 150~250ms |
 | 时区一致性 | 5 | 浏览器时区与 IP 归属地时区不一致 → 代理迹象；若浏览器时区指向中国则计入中国分 |
-| WebRTC 泄露 | 5 | STUN (srflx) 公网地址与 HTTP 出口 IP 不一致 → HTTP 走代理而 UDP 直连 |
+| WebRTC 泄露 | 4 | STUN (srflx) 暴露的真实公网 IP 经 chnroutes 判定在中国大陆（最强），或与 HTTP 出口不一致（仅代理迹象） |
 
-每项检测产出 0~1 的置信度，乘以权重后求和，总分 0–100：
+每项检测产出 0~1 的置信度，乘以权重后求和得到基础分。在此之上还有**综合研判**层：交叉比对信号之间的一致性，发现矛盾时额外加分（封顶 100）——
+
+- IP 在境外，但到大陆站点 < 60ms 且到美国站点 > 300ms → +12（物理位置高度疑似大陆，IP 是分流代理出口）
+- 设备为大陆行货/中国区（🇹🇼 被屏蔽），IP 却在境外 → +8（疑似使用代理的中国用户）
+
+总分 0–100：
 
 - **≥ 60**：很可能被识别为中国大陆用户
 - **35–59**：具有较明显的中国大陆特征
@@ -30,13 +45,18 @@
 ## 架构
 
 ```
-public/          静态页面（Cloudflare Static Assets 直接托管）
+public/               静态页面（Cloudflare Static Assets 直接托管）
   index.html
-  app.js         全部检测与打分逻辑（无依赖的原生 JS）
+  app.js              全部检测与打分逻辑（无依赖的原生 JS）
   style.css
-src/index.ts     Worker：仅处理 /api/*
-  GET /api/ip    返回 request.cf 中的 IP、国家、ASN、时区、colo、clientTcpRtt 等
-  GET /api/ping  204 空响应，供前端测量到 Cloudflare 边缘的往返延迟
+src/index.ts          Worker：仅处理 /api/*
+  GET /api/ip         返回 request.cf 中的 IP、国家、ASN、时区、colo，并附 chnroutes 判定
+  GET /api/ip-china   判断任意 IPv4 是否属于中国大陆（供 WebRTC 泄露比对）
+src/chnroutes.ts      IPv4 是否在中国大陆的二分查找
+src/chnroutes-data.ts 自动生成的 CIDR 区间数据（勿手改）
+scripts/build-chnroutes.mjs  刷新 chnroutes 数据：node scripts/build-chnroutes.mjs
+.github/workflows/update-chnroutes.yml  每日定时重建 chnroutes，有变化才提交（触发自动部署）
+dns-probe/            可选：部署在自有 VPS 上的 DNS 泄露探测服务（见其 README）
 ```
 
 `wrangler.jsonc` 中 `run_worker_first: ["/api/*"]`——静态资源不经过 Worker，不产生请求费用。
@@ -53,7 +73,7 @@ npm run deploy   # 部署到 Cloudflare
 
 ## 已知局限
 
-- **DNS 检测**：浏览器无法直接观察 DNS 解析结果，真正的解析器/污染检测需要一个带通配符解析的自有域名配合日志，v1 未实现（Google 可达性探测已部分覆盖 DNS 污染的效果）。
+- **DNS 解析器检测**：主站无法独立完成——需要一台自有 VPS 作权威 DNS 观测解析器出口。`dns-probe/` 已提供可部署的服务端与接入说明，但前端接入尚未合入主站。
 - **全局代理下的 VPN 用户**：若所有流量都走代理且时区/语言已伪装，则与真实海外用户不可区分——这也是真实网站面临的同样极限。
 - **误报来源**：广告拦截插件会拦截对 Google/百度的探测；公司防火墙可能屏蔽 UDP（影响 WebRTC 检测）或大陆站点。
 

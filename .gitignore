@@ -3,3 +3,7 @@ node_modules/
 .dev.vars
 *.log
 .DS_Store
+
+# dns-probe 本地配置与编译产物
+dns-probe/.env
+dns-probe/dns-probe
