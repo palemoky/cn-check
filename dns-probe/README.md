@@ -9,14 +9,14 @@
 ## 原理
 
 ```
-浏览器                           用户的递归解析器          本服务
+浏览器                             用户的递归解析器           本服务
   │  请求 <uuid>.d.example.com          │                    │
-  │─────────────────────────────────────▶│                    │
-  │                                      │  查 A 记录         │
-  │                                      │───────────────────▶│  记录：uuid → 解析器出口IP
-  │                                      │◀───────────────────│  返回 A = VPS IP
-  │  再调用 GET /lookup?id=<uuid> ───────────────────────────▶│  返回解析器出口IP
-  │                                                           │
+  │───────────────────────────────────▶│                    │
+  │                                    │   查 A 记录         │
+  │                                    │───────────────────▶│  记录：uuid → 解析器出口IP
+  │                                    │◀───────────────────│  返回 A = VPS IP
+  │  再调用 GET /lookup?id=<uuid> ──────────────────────────▶│  返回解析器出口IP
+  │                                                         │
   ▼
 把解析器出口IP 交给主站 /api/ip-china 判断是否在中国大陆
 ```
@@ -86,43 +86,32 @@ docker compose down                           # 停止并移除
 
 > 每次改动 `dns-probe/` 并推送到 `main`，Actions 会自动重建镜像；服务器执行 `docker compose pull && docker compose up -d` 即可更新。
 
-### 4. 给查询 API 加 HTTPS（必需）
+### 4. 暴露查询 API（HTTP 即可，无需 HTTPS）
 
-主站是 HTTPS，浏览器不允许从 HTTPS 页面请求 HTTP 接口。用 Caddy 一行搞定（自动签证书）：
+查询 API 由主站的 Cloudflare Worker **服务端**代理（见下方「前端接入」），浏览器不直接访问它，因此**只需 HTTP:80**，不必在 VPS 上解决 HTTPS/证书/443 端口问题。
 
-```
-# /etc/caddy/Caddyfile
-probe.example.com {
-    reverse_proxy 127.0.0.1:8653
-}
-```
+只要让 traefik（或任意反代）把 `ns-probe.palemoky.com` 的 HTTP 请求转发到本容器的 `:8653` 即可。traefik label 示例（HTTP router，注意不是 tcp router）：
 
-前端就能请求 `https://probe.example.com/lookup?id=<uuid>`。
-
-## 前端接入（主站侧，尚未实现）
-
-在 `public/app.js` 里新增一项检测，大致流程：
-
-```js
-const uuid = crypto.randomUUID();
-// 1. 触发解析：请求一张挂在委派子域上的图片（走 no-cors 即可）
-await fetch(`https://${uuid}.d.example.com/x.png`, { mode: "no-cors" }).catch(
-  () => {},
-);
-// 2. 稍等解析器落库，再查解析器出口
-await new Promise((r) => setTimeout(r, 1500));
-const { resolvers } = await (
-  await fetch(`https://probe.example.com/lookup?id=${uuid}`)
-).json();
-// 3. 把每个解析器 IP 交给主站判断是否在中国大陆
-for (const ip of resolvers) {
-  const { china } = await (await fetch(`/api/ip-china?ip=${ip}`)).json();
-  // china === true 且 HTTP 出口在境外 → 强中国特征
-}
+```yaml
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.dns-probe.entrypoints=http
+  - traefik.http.routers.dns-probe.rule=Host(`ns-probe.palemoky.com`)
+  - traefik.http.services.dns-probe.loadbalancer.server.port=8653
 ```
 
-> 需要 `<uuid>.d.example.com` 能响应 HTTP（哪怕 404 也行，目的是触发 DNS 解析）。
-> 最省事的做法：让本服务的 `-answer` 指向 VPS，并在 VPS 的 :80/:443 上跑一个对所有路径返回 1x1 图片的极简 HTTP 服务。
+验证：`curl "http://ns-probe.palemoky.com/lookup?id=abc123"` 能返回 JSON 即可。
+
+## 前端接入（已合入主站）
+
+主站 `public/app.js` 的「DNS 解析器归属」检测已实现，无需本服务对外暴露 HTTPS：
+
+1. 前端 `fetch("https://<uuid>.d.palemoky.com/", { mode: "no-cors" })` 触发浏览器解析器查询本服务（连接失败无妨，DNS 解析已发生）。
+2. 前端调用主站 **`/api/dns-lookup?id=<uuid>`**——由 Cloudflare Worker **服务端**代理请求本服务的 `http://ns-probe.palemoky.com/lookup`，回收解析器出口 IP 并顺带做 chnroutes 判定后返回。
+3. 浏览器全程只与主站 HTTPS 通信，因此本服务的查询 API **只需 HTTP:80**（经 traefik 暴露即可），不必解决 VPS 侧的 HTTPS/443 问题。
+
+> Worker 中的上游地址常量为 `DNS_PROBE_LOOKUP`（`src/index.ts`），委派子域常量为 `DNS_PROBE_ZONE`（`public/app.js`），按你的实际域名调整。
+> `<uuid>.d.palemoky.com` 无需真正响应 HTTP，只要能触发 DNS 解析即可（本服务对任意 `*.<zone>` 都返回 `-answer` 指定的 A 记录）。
 
 ## 隐私
 

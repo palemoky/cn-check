@@ -5,16 +5,21 @@
  * 总分 100。每项检测产出 0~1 的置信度，乘以权重后求和。
  * ============================================================ */
 const WEIGHTS = {
-  ipCountry: 23,   // IP 归属地为中国大陆
-  blocked: 18,     // 无法访问 Google 等在大陆被屏蔽的服务
-  latency: 13,     // 到大陆站点的延迟显著更低（说明物理位置近）
+  ipCountry: 21,   // IP 归属地为中国大陆
+  blocked: 16,     // 无法访问 Google 等在大陆被屏蔽的服务
+  latency: 12,     // 到大陆站点的延迟显著更低（说明物理位置近）
   timezone: 11,    // 浏览器时区为中国时区
   language: 10,    // 浏览器语言为简体中文
+  dnsLeak: 9,      // DNS 解析器出口在中国大陆（分流代理常只代理 HTTP、DNS 仍走国内）
   twFlag: 8,       // 台湾旗帜 emoji 被屏蔽（大陆行货/中国区 Apple 设备，VPN 无法掩盖）
-  intlLatency: 8,  // 到美国站点延迟异常偏高而大陆很近（跨境拥堵/GFW 检测开销的典型形态）
-  tzMismatch: 5,   // 浏览器时区与 IP 归属地时区不一致（代理迹象）
+  intlLatency: 6,  // 到美国站点延迟异常偏高而大陆很近（跨境拥堵/GFW 检测开销的典型形态）
+  tzMismatch: 3,   // 浏览器时区与 IP 归属地时区不一致（代理迹象）
   webrtc: 4,       // WebRTC 泄露的真实公网 IP 在中国，或与 HTTP 出口不一致
 };
+
+// DNS 泄露检测用的委派子域（VPS 上的 dns-probe 对其权威）。
+// 前端请求 <uuid>.<该域> 触发解析，解析器出口 IP 由 /api/dns-lookup 回收。
+const DNS_PROBE_ZONE = "d.palemoky.com";
 
 const THRESHOLDS = {
   fetchTimeout: 4000,   // 可达性探测超时 (ms)
@@ -382,6 +387,58 @@ async function checkWebRTC(ipInfo) {
   };
 }
 
+async function checkDnsLeak() {
+  const uuid = (crypto.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2)).replace(/[^a-z0-9-]/gi, "");
+  // 1. 请求 <uuid>.<zone> 触发浏览器所用递归解析器去查询 VPS 权威服务器。
+  //    连接本身成功与否无所谓——DNS 解析在建立连接前就已发生。
+  await fetch(`https://${uuid}.${DNS_PROBE_ZONE}/`, { mode: "no-cors", cache: "no-store" })
+    .catch(() => {});
+  // 2. 给解析器留一点落库时间，再经本站 Worker 代理回收解析器出口 IP
+  await new Promise((r) => setTimeout(r, 1500));
+  let data;
+  try {
+    const res = await fetch(`/api/dns-lookup?id=${uuid}`, { cache: "no-store" });
+    data = await res.json();
+  } catch (e) {
+    return { confidence: 0, summary: "无法判断", detail: "查询 DNS 探测服务失败：" + e };
+  }
+
+  if (data.available === false) {
+    return {
+      confidence: 0,
+      summary: "探测服务不可用",
+      detail: "DNS 泄露探测服务（VPS）未部署或不可达，此项跳过",
+    };
+  }
+  const resolvers = data.resolvers || [];
+  if (resolvers.length === 0) {
+    return {
+      confidence: 0,
+      summary: "未捕获解析器",
+      detail:
+        "未能在时限内观测到你的解析器查询——可能是 DNS 委派未生效、解析被缓存，或浏览器未真正发起解析",
+    };
+  }
+  const chinaOne = resolvers.find((r) => r.china);
+  const list = resolvers.map((r) => `${r.ip}${r.china ? "（中国大陆）" : ""}`).join("\n");
+  if (chinaOne) {
+    return {
+      confidence: 1,
+      chinaDns: true,
+      flags: [`DNS 解析器出口 (${chinaOne.ip}) 在中国大陆`],
+      summary: "解析器在中国大陆",
+      detail:
+        `观测到的解析器出口:\n${list}\n` +
+        "DNS 解析走了中国大陆的解析器——分流代理常只代理 HTTP、DNS 仍用国内运营商，这是很强的中国特征",
+    };
+  }
+  return {
+    confidence: 0,
+    summary: "解析器在境外",
+    detail: `观测到的解析器出口:\n${list}\n均不在中国大陆`,
+  };
+}
+
 /* ============================================================
  * 汇总打分与渲染
  * ============================================================ */
@@ -392,6 +449,7 @@ const CHECK_DEFS = [
   { key: "latency", icon: "⚡", name: "大陆站点延迟" },
   { key: "timezone", icon: "🕐", name: "浏览器时区" },
   { key: "language", icon: "🀄️", name: "浏览器语言" },
+  { key: "dnsLeak", icon: "🔀", name: "DNS 解析器归属" },
   { key: "twFlag", icon: "🏳️", name: "台湾旗帜 Emoji" },
   { key: "intlLatency", icon: "🌍", name: "国际站点延迟" },
   { key: "tzMismatch", icon: "🎭", name: "时区一致性" },
@@ -544,16 +602,18 @@ async function runAll() {
 
   // 网络探测并行跑；国际延迟检测依赖大陆延迟的结果，共享同一个 promise
   const latencyPromise = checkLatency();
-  const [blocked, latency, intl, webrtc] = await Promise.all([
+  const [blocked, latency, intl, webrtc, dns] = await Promise.all([
     checkBlocked().catch((e) => (failCard("blocked", e), null)),
     latencyPromise.catch((e) => (failCard("latency", e), null)),
     checkIntlLatency(latencyPromise).catch((e) => (failCard("intlLatency", e), null)),
     checkWebRTC(ipInfo).catch((e) => (failCard("webrtc", e), null)),
+    checkDnsLeak().catch((e) => (failCard("dnsLeak", e), null)),
   ]);
 
   if (blocked) record("blocked", blocked);
   if (latency) record("latency", latency);
   if (intl) record("intlLatency", intl);
+  if (dns) record("dnsLeak", dns);
   if (webrtc) {
     // 泄露 IP 在中国 → 直接计分；仅“与 HTTP 出口不一致”的代理迹象则需其他中国信号佐证
     if (webrtc.confidence > 0 && !webrtc.chinaLeak && !tzChina && !langChina)
@@ -581,6 +641,12 @@ async function runAll() {
     analysis.push({
       bonus: 8,
       text: "设备为大陆行货或中国区系统（🇹🇼 被屏蔽），IP 却在境外：疑似使用代理的中国用户",
+    });
+  }
+  if (notCN && dns?.chinaDns) {
+    analysis.push({
+      bonus: 8,
+      text: "DNS 解析器出口在中国大陆，IP 却在境外：典型的分流代理（只代理 HTTP、DNS 走国内）",
     });
   }
   // 注：「时区为中国 + IP 在境外」的矛盾已由 tzMismatch 权重项计分，不在此重复加分

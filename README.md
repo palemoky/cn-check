@@ -18,20 +18,22 @@
 
 | 检测项 | 权重 | 原理 |
 |---|---:|---|
-| IP 归属地 | 23 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），并用 chnroutes CIDR 独立核对；最直接的信号 |
-| 被屏蔽服务可达性 | 18 | 探测 Google (`generate_204`) 是否可达；不可达强烈暗示身处 GFW 之内 |
-| 大陆站点延迟 | 13 | 对百度、腾讯、哔哩哔哩 favicon 各采样 3 次取每站最小值，再取三站中**第二低**的值打分（单站可能有海外 CDN 节点，需两站佐证）；< 60ms 说明物理位置在大陆或紧邻 |
+| IP 归属地 | 21 | Cloudflare 边缘提供的 IP 地理位置（`request.cf.country`），并用 chnroutes CIDR 独立核对；最直接的信号 |
+| 被屏蔽服务可达性 | 16 | 探测 Google (`generate_204`) 是否可达；不可达强烈暗示身处 GFW 之内 |
+| 大陆站点延迟 | 12 | 对百度、腾讯、哔哩哔哩 favicon 各采样 3 次取每站最小值，再取三站中**第二低**的值打分（单站可能有海外 CDN 节点，需两站佐证）；< 60ms 说明物理位置在大陆或紧邻 |
 | 浏览器时区 | 11 | `Intl.DateTimeFormat().resolvedOptions().timeZone` 为 `Asia/Shanghai` 等 |
 | 浏览器语言 | 10 | `navigator.languages` 首选 `zh-CN` / `zh-Hans` |
+| DNS 解析器归属 | 9 | 前端触发 `<uuid>.d.palemoky.com` 解析，VPS 上的 dns-probe 记录解析器出口 IP，Worker 代理回收并 chnroutes 判定；解析器在大陆而 HTTP 在境外 = 分流代理特征。需部署 `dns-probe/`，未部署则此项跳过不计分 |
 | 台湾旗帜 Emoji | 8 | 大陆行货或地区设为中国的 Apple 设备会屏蔽 🇹🇼（canvas 对比连字与拆分渲染 + 彩色像素判定，用 🇨🇳 做对照）；设备级信号，VPN 无法掩盖 |
-| 国际站点延迟 | 8 | 以 AWS 美东/美西/东京/新加坡区域端点为参照（位置固定、无全球 CDN）；「大陆很近 + 美国异常慢（>300ms）」是跨境线路拥堵/GFW 开销的典型形态，港/新/日/韩直连美国多在 150~250ms |
-| 时区一致性 | 5 | 浏览器时区与 IP 归属地时区不一致 → 代理迹象；若浏览器时区指向中国则计入中国分 |
+| 国际站点延迟 | 6 | 以 AWS 美东/美西/东京/新加坡区域端点为参照（位置固定、无全球 CDN）；「大陆很近 + 美国异常慢（>300ms）」是跨境线路拥堵/GFW 开销的典型形态，港/新/日/韩直连美国多在 150~250ms |
+| 时区一致性 | 3 | 浏览器时区与 IP 归属地时区不一致 → 代理迹象；若浏览器时区指向中国则计入中国分 |
 | WebRTC 泄露 | 4 | STUN (srflx) 暴露的真实公网 IP 经 chnroutes 判定在中国大陆（最强），或与 HTTP 出口不一致（仅代理迹象） |
 
 每项检测产出 0~1 的置信度，乘以权重后求和得到基础分。在此之上还有**综合研判**层：交叉比对信号之间的一致性，发现矛盾时额外加分（封顶 100）——
 
 - IP 在境外，但到大陆站点 < 60ms 且到美国站点 > 300ms → +12（物理位置高度疑似大陆，IP 是分流代理出口）
 - 设备为大陆行货/中国区（🇹🇼 被屏蔽），IP 却在境外 → +8（疑似使用代理的中国用户）
+- DNS 解析器出口在大陆，IP 却在境外 → +8（分流代理：只代理 HTTP、DNS 走国内）
 
 总分 0–100：
 
@@ -52,6 +54,7 @@ public/               静态页面（Cloudflare Static Assets 直接托管）
 src/index.ts          Worker：仅处理 /api/*
   GET /api/ip         返回 request.cf 中的 IP、国家、ASN、时区、colo，并附 chnroutes 判定
   GET /api/ip-china   判断任意 IPv4 是否属于中国大陆（供 WebRTC 泄露比对）
+  GET /api/dns-lookup 服务端代理 VPS 的 dns-probe，回收解析器出口 IP 并 chnroutes 判定
 src/chnroutes.ts      IPv4 是否在中国大陆的二分查找
 src/chnroutes-data.ts 自动生成的 CIDR 区间数据（勿手改）
 scripts/build-chnroutes.mjs  刷新 chnroutes 数据：node scripts/build-chnroutes.mjs
@@ -73,7 +76,7 @@ npm run deploy   # 部署到 Cloudflare
 
 ## 已知局限
 
-- **DNS 解析器检测**：主站无法独立完成——需要一台自有 VPS 作权威 DNS 观测解析器出口。`dns-probe/` 已提供可部署的服务端与接入说明，但前端接入尚未合入主站。
+- **DNS 解析器检测依赖 VPS**：该项需要一台自有 VPS 部署 `dns-probe/` 作权威 DNS 观测解析器出口。前端与 Worker 代理（`/api/dns-lookup`）已合入主站；VPS 未部署或不可达时此项自动跳过、不计分，不影响其它检测。
 - **全局代理下的 VPN 用户**：若所有流量都走代理且时区/语言已伪装，则与真实海外用户不可区分——这也是真实网站面临的同样极限。
 - **误报来源**：广告拦截插件会拦截对 Google/百度的探测；公司防火墙可能屏蔽 UDP（影响 WebRTC 检测）或大陆站点。
 
