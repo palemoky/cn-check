@@ -513,45 +513,73 @@ async function checkDnsLeak() {
  * ============================================================ */
 
 const CHECK_DEFS = [
-  { key: "ipCountry", icon: "🌐", name: "IP 归属地" },
-  { key: "blocked", icon: "🚧", name: "被屏蔽服务可达性" },
-  { key: "latency", icon: "⚡", name: "大陆站点延迟" },
-  { key: "timezone", icon: "🕐", name: "浏览器时区" },
-  { key: "language", icon: "🀄️", name: "浏览器语言" },
-  { key: "dnsLeak", icon: "🔀", name: "DNS 解析器归属" },
-  { key: "twFlag", icon: "🏳️", name: "旗帜 Emoji" },
-  { key: "intlLatency", icon: "🌍", name: "国际站点延迟" },
-  { key: "tzMismatch", icon: "🎭", name: "时区一致性" },
-  { key: "webrtc", icon: "🔓", name: "WebRTC 泄露" },
+  { key: "ipCountry", name: "IP 归属地" },
+  { key: "blocked", name: "被屏蔽服务可达性" },
+  { key: "latency", name: "大陆站点延迟" },
+  { key: "timezone", name: "浏览器时区" },
+  { key: "language", name: "浏览器语言" },
+  { key: "dnsLeak", name: "DNS 解析器归属" },
+  { key: "twFlag", name: "旗帜 Emoji" },
+  { key: "intlLatency", name: "国际站点延迟" },
+  { key: "tzMismatch", name: "时区一致性" },
+  { key: "webrtc", name: "WebRTC 泄露" },
 ];
+
+const STATUS_LABEL = { pending: "检测中", hit: "命中", partial: "部分命中", miss: "未命中", fail: "失败" };
+
+// 权重条长度按最大权重归一，直观展示各项在总分中的分量
+const MAX_WEIGHT = Math.max(...Object.values(WEIGHTS));
+
+let doneCount = 0;
+
+function updateProgress() {
+  doneCount++;
+  if (doneCount < CHECK_DEFS.length)
+    $("#score-verdict").textContent = `检测中 · 已完成 ${doneCount} / ${CHECK_DEFS.length}`;
+}
 
 function renderCards() {
   const grid = $("#checks");
   grid.innerHTML = "";
-  for (const def of CHECK_DEFS) {
-    const card = document.createElement("div");
+  doneCount = 0;
+  CHECK_DEFS.forEach((def, i) => {
+    const w = WEIGHTS[def.key];
+    const card = document.createElement("article");
     card.className = "card pending";
     card.id = `check-${def.key}`;
     card.innerHTML = `
-      <div class="card-head">
-        <span class="card-icon">${def.icon}</span>
-        <span class="card-name">${def.name}</span>
-        <span class="card-score" title="得分 / 权重">– / ${WEIGHTS[def.key]}</span>
-      </div>
-      <div class="card-summary">检测中…</div>
-      <pre class="card-detail"></pre>
-      <div class="card-note"></div>`;
+      <span class="card-index">${String(i + 1).padStart(2, "0")}</span>
+      <div class="card-body">
+        <div class="card-head">
+          <h3 class="card-name">${def.name}</h3>
+          <span class="card-status">${STATUS_LABEL.pending}</span>
+          <span class="card-weight" title="得分 / 权重">
+            <span class="card-meter" style="--w:${w / MAX_WEIGHT}"><i></i></span>
+            <span class="card-score">– / ${w}</span>
+          </span>
+        </div>
+        <div class="card-summary">…</div>
+        <pre class="card-detail"></pre>
+        <div class="card-note"></div>
+      </div>`;
     grid.appendChild(card);
-  }
+  });
+}
+
+function setCardState(card, key, state, score) {
+  card.classList.remove("pending", "hit", "partial", "miss", "fail");
+  card.classList.add(state);
+  card.querySelector(".card-status").textContent = STATUS_LABEL[state];
+  card.style.setProperty("--pct", score / WEIGHTS[key]);
+  // 部分命中会产生小数（如置信度 0.4 × 权重 23 = 9.2），整数时不显示 .0
+  card.querySelector(".card-score").textContent = `${+score.toFixed(1)} / ${WEIGHTS[key]}`;
+  updateProgress();
 }
 
 function fillCard(key, result, score) {
   const card = $(`#check-${key}`);
   if (!card) return;
-  card.classList.remove("pending");
-  card.classList.add(score >= WEIGHTS[key] * 0.8 ? "hit" : score > 0 ? "partial" : "miss");
-  // 部分命中会产生小数（如置信度 0.4 × 权重 23 = 9.2），整数时不显示 .0
-  card.querySelector(".card-score").textContent = `${+score.toFixed(1)} / ${WEIGHTS[key]}`;
+  setCardState(card, key, score >= WEIGHTS[key] * 0.8 ? "hit" : score > 0 ? "partial" : "miss", score);
   card.querySelector(".card-summary").textContent = result.summary;
   const detailEl = card.querySelector(".card-detail");
   // detailHtml 用于需要富结构的项（如可折叠的解析器列表）；其余仍走纯文本
@@ -566,11 +594,20 @@ function fillCard(key, result, score) {
 function failCard(key, err) {
   const card = $(`#check-${key}`);
   if (!card) return;
-  card.classList.remove("pending");
-  card.classList.add("miss");
-  card.querySelector(".card-score").textContent = `0 / ${WEIGHTS[key]}`;
+  setCardState(card, key, "fail", 0);
   card.querySelector(".card-summary").textContent = "检测失败";
   card.querySelector(".card-detail").textContent = String(err);
+}
+
+// 分数从 0 平滑滚动到目标值
+function animateNumber(el, to, duration = 900) {
+  const start = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - start) / duration);
+    el.textContent = Math.round(to * (1 - Math.pow(1 - p, 3)));
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function verdict(score) {
@@ -582,20 +619,21 @@ function verdict(score) {
 
 function renderScore(total, flags, analysis) {
   const [text, level] = verdict(total);
-  $("#score-num").textContent = Math.round(total);
+  const scoreEl = $("#score");
+  animateNumber($("#score-num"), Math.round(total));
   $("#score-verdict").textContent = text;
-  const bar = $("#score-bar-fill");
-  bar.style.width = `${Math.min(100, total)}%`;
-  $("#score").dataset.level = level;
+  scoreEl.style.setProperty("--score", Math.min(100, total));
+  scoreEl.dataset.level = level;
 
   const analysisEl = $("#analysis");
   if (analysis?.length) {
     analysisEl.hidden = false;
     analysisEl.innerHTML =
-      "<strong>综合研判（信号交叉比对，额外计分）：</strong>" +
+      "<h4>综合研判<small>信号交叉比对，额外计分</small></h4><ul>" +
       analysis
-        .map((a) => `<div class="analysis-item">🔍 ${a.text}（+${a.bonus} 分）</div>`)
-        .join("");
+        .map((a) => `<li class="analysis-item"><span>${a.text}</span><b>+${a.bonus}</b></li>`)
+        .join("") +
+      "</ul>";
   } else {
     analysisEl.hidden = true;
   }
@@ -604,8 +642,9 @@ function renderScore(total, flags, analysis) {
   if (flags.length) {
     flagsEl.hidden = false;
     flagsEl.innerHTML =
-      "<strong>代理 / VPN 迹象：</strong>" +
-      flags.map((f) => `<div class="flag">⚠️ ${f}</div>`).join("");
+      "<h4>代理 / VPN 迹象</h4><ul>" +
+      flags.map((f) => `<li class="flag">${f}</li>`).join("") +
+      "</ul>";
   } else {
     flagsEl.hidden = true;
   }
@@ -613,7 +652,8 @@ function renderScore(total, flags, analysis) {
 
 async function runAll() {
   $("#rerun").disabled = true;
-  $("#score-num").textContent = "…";
+  $("#score").dataset.level = "pending";
+  $("#score-num").textContent = "–";
   $("#score-verdict").textContent = "检测中，约需 10 秒";
   $("#flags").hidden = true;
   $("#analysis").hidden = true;
