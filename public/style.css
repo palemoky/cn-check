@@ -522,6 +522,8 @@ footer p { margin: 0; }
     position: sticky;
     top: 2rem;
     margin-bottom: 0;
+    /* 窄屏时底线用来隔开下方的检测列表；双栏时右栏自带顶线，这里的底线无所分隔 */
+    border-bottom: 0;
   }
 
   #checks {
